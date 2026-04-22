@@ -1849,7 +1849,14 @@ function calculateAdjustedDates() {
       const depEntry = typeof dep === 'object' ? dep : { id: dep, type: 'blocking', leadDays: 0 };
       const depAdj = adjusted[depEntry.id];
       if (!depAdj) return;
-      const depEnd = parseDate(depAdj.end);
+      let depEnd = parseDate(depAdj.end);
+
+      // Late-completed dep: use completedDate as effective end if it's later than planned end
+      const depProj = projects.find(x => x.id === depEntry.id);
+      if (depProj && isComplete(depProj) && depProj.completedDate) {
+        const completed = parseDate(depProj.completedDate);
+        if (completed > depEnd) depEnd = completed;
+      }
 
       if (depEntry.type === 'synergistic') {
         // Dep must finish at least leadDays before this project finishes
@@ -1977,7 +1984,14 @@ function calculateAdjustedDates() {
         if (depEntry.type === 'synergistic') return;
         const depAdj = adjusted[depEntry.id];
         if (!depAdj) return;
-        const depEnd = parseDate(depAdj.end);
+        const depProj = projects.find(x => x.id === depEntry.id);
+        let depEnd = parseDate(depAdj.end);
+        // If the dep is a completed stage-gate/project with a recorded completedDate that is
+        // later than its planned end, that late completion is the real blocking date.
+        if (depProj && isComplete(depProj) && depProj.completedDate) {
+          const completed = parseDate(depProj.completedDate);
+          if (completed > depEnd) depEnd = completed;
+        }
         if (!latestBlockingEnd || depEnd > latestBlockingEnd) latestBlockingEnd = depEnd;
       });
 
