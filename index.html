@@ -2030,6 +2030,112 @@ function calculateAdjustedDates() {
   return { adjusted, delays };
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Health scoring — single source of truth for the active panel and the
+// snapshot written into the JSONBin (consumed by the R&D Hub).
+//
+// Inputs: a project `p`, plus `adjusted` and `delays` maps from
+// calculateAdjustedDates(). Output: { score, expectedPct, delayDays, isOverdue }.
+//
+// Note: `today`, `parseDate`, `isComplete`, and `projects` are all top-level
+// and intentionally referenced as such — keep this function free of closure
+// dependencies so it can be called from save paths too.
+//
+// Team Gantt: no stage-gate health penalty (that's an R&D-Gantt-specific rule).
+// ─────────────────────────────────────────────────────────────────────────────
+function computeProjectHealth(p, adjusted, delays) {
+  const adj = adjusted[p.id] || {};
+  const origEnd   = parseDate(adj.originalEnd   || p.end).getTime();
+  const origStart = parseDate(adj.originalStart || p.start).getTime();
+  const duration  = origEnd - origStart;
+  const elapsed   = today.getTime() - origStart;
+  const expectedPct = duration > 0 ? Math.min(100, Math.max(0, (elapsed / duration) * 100)) : 0;
+  const actualPct   = p.progress || 0;
+  const delayDays   = delays[p.id] || 0;
+  const isOverdue   = parseDate(adj.originalEnd || p.end) < today && !isComplete(p);
+  let score = 100;
+  if (expectedPct > 0) score -= Math.max(0, expectedPct - actualPct) * 0.6;
+  if (delayDays > 0)   score -= Math.min(30, delayDays * 1.5);
+  if (isOverdue)       score -= 20;
+  score = Math.round(Math.max(0, Math.min(100, score)));
+  return { score, expectedPct: Math.round(expectedPct), delayDays, isOverdue };
+}
+
+// Status bucket — uses unified keys ('ontrack' | 'watch' | 'atrisk') so the
+// hub's display layer can render consistently across all Gantt sources, even
+// when each Gantt's local labels differ.
+function healthStatusKey(score) {
+  return score >= 70 ? 'ontrack' : score >= 40 ? 'watch' : 'atrisk';
+}
+
+// Stage-gate state classifier — returns one of:
+// 'passed' | 'passed-late' | 'overdue' | 'in-progress' | 'pending'.
+function classifyGateState(sg) {
+  const passed = isComplete(sg);
+  const due = sg.end ? parseDate(sg.end) <= today : false;
+  const inProgress = !passed && (sg.progress || 0) > 0;
+  const passedLate = passed && sg.completedDate && sg.end && parseDate(sg.completedDate) > parseDate(sg.end);
+  if (passed && passedLate) return 'passed-late';
+  if (passed)               return 'passed';
+  if (due)                  return 'overdue';
+  if (inProgress)           return 'in-progress';
+  return 'pending';
+}
+
+// Build the gates list for an objective: prefer real stage-gate sub-projects
+// when present, otherwise fall back to inline definitions in p.stageGates.
+function gatesForObjective(p) {
+  const subs = projects.filter(sg => sg.isStageGate && sg.parentId === p.id)
+    .sort((a, b) => parseDate(a.end) - parseDate(b.end));
+  if (subs.length > 0) {
+    return subs.map(sg => ({ name: sg.name || '', state: classifyGateState(sg) }));
+  }
+  const inline = (p.stageGates || []).filter(sg => sg.name && sg.name.trim());
+  return inline.map(sg => ({
+    name: sg.name,
+    state: classifyGateState({
+      end: sg.endDate || p.end,
+      progress: calculateKpiProgress(sg.kpis || []),
+      manuallyCompleted: false,
+      isStageGate: true
+    })
+  }));
+}
+
+// Build the snapshot persisted alongside `projects`. The R&D Hub reads this
+// to render status indicators on Stage-gate tiles without re-running the
+// cascade and health math itself. Keep payload small — one entry per
+// objective is plenty.
+function computeStatusSnapshot() {
+  try {
+    const { adjusted, delays } = calculateAdjustedDates();
+    const objectives = {};
+    projects.forEach(p => {
+      if (!p || p.projectType !== 'objective') return;
+      const h = computeProjectHealth(p, adjusted, delays);
+      const adj = adjusted[p.id] || {};
+      const adjEnd = parseDate(adj.end || p.end);
+      const daysLeft = Math.ceil((adjEnd - today) / 86400000);
+      objectives[String(p.id)] = {
+        name: p.name || '',
+        slug: (typeof generateProjectId === 'function') ? generateProjectId(p) : '',
+        score: h.score,
+        status: healthStatusKey(h.score),
+        progress: p.progress || 0,
+        daysLeft,
+        delayDays: h.delayDays,
+        isComplete: isComplete(p),
+        gates: gatesForObjective(p)
+      };
+    });
+    return { computedAt: new Date().toISOString(), objectives };
+  } catch (e) {
+    // Never let snapshot failure block a save — return an empty snapshot.
+    console.warn('computeStatusSnapshot failed:', e);
+    return { computedAt: new Date().toISOString(), objectives: {}, error: String(e && e.message || e) };
+  }
+}
+
 // What-if mode functions
 function toggleWhatIfMode() {
   whatIfMode = !whatIfMode;
@@ -2415,7 +2521,10 @@ function getPayload() {
   return {
     projects, resources, equipment, products,
     divisionColors, productColors, resourceMeta, equipmentMeta,
-    changelog, collapsed: [...collapsed]
+    changelog, collapsed: [...collapsed],
+    // Computed snapshot consumed by the R&D Hub. Recomputed on every save so
+    // the bin always reflects current health for downstream readers.
+    computedStatus: computeStatusSnapshot()
   };
 }
 
@@ -4044,22 +4153,11 @@ function renderActivePanel() {
   const divFilter = document.getElementById('activeFilter')?.value || 'all';
 
   // ── Helpers ──────────────────────────────────────────────────────────────────
+  // getHealth is a thin closure over `adjusted`/`delays`; the actual formula
+  // lives in top-level computeProjectHealth so the JSONBin snapshot writer
+  // can reuse it without rebuilding closures.
   function getHealth(p) {
-    const adj = adjusted[p.id] || {};
-    const origEnd   = parseDate(adj.originalEnd   || p.end).getTime();
-    const origStart = parseDate(adj.originalStart || p.start).getTime();
-    const duration  = origEnd - origStart;
-    const elapsed   = today.getTime() - origStart;
-    const expectedPct = duration > 0 ? Math.min(100, Math.max(0, (elapsed / duration) * 100)) : 0;
-    const actualPct   = p.progress || 0;
-    const delayDays   = delays[p.id] || 0;
-    const isOverdue   = parseDate(adj.originalEnd || p.end) < today && !isComplete(p);
-    let score = 100;
-    if (expectedPct > 0) score -= Math.max(0, expectedPct - actualPct) * 0.6;
-    if (delayDays > 0)   score -= Math.min(30, delayDays * 1.5);
-    if (isOverdue)       score -= 20;
-    score = Math.round(Math.max(0, Math.min(100, score)));
-    return { score, expectedPct: Math.round(expectedPct), delayDays, isOverdue };
+    return computeProjectHealth(p, adjusted, delays);
   }
 
   function healthLabel(score) { return score >= 70 ? 'On track' : score >= 40 ? 'At risk' : 'Off track'; }
